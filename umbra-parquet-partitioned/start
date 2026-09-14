@@ -1,9 +1,51 @@
 #!/bin/bash
 set -eu
 
+source ../local-env.sh
+
 if PGPASSWORD=postgres psql -p 5432 -h 127.0.0.1 -U postgres -c 'SELECT 1' >/dev/null 2>&1; then
     exit 0
 fi
+
+if [ "$LOCAL" -eq 1 ]; then
+    # Give the local server the same resource limits the Docker container gets
+    # (the --ulimit flags below): nofile=1048576 and unlimited memlock. Without
+    # a high memlock the server can't register its io_uring buffers
+    # ("io_uring_register_buffers: Cannot allocate memory") and falls back to a
+    # slower writeback path. Lifting the hard caps needs privilege (just like
+    # Docker's --ulimit), so raise them on this shell via sudo; the server,
+    # forked below, inherits them while still running as the current user.
+    sudo prlimit --pid "$$" --nofile=1048576:1048576 --memlock=unlimited:unlimited
+
+    # Launch the locally-built server against the db file that install
+    # created (and that load populated). The driver restarts us once per
+    # query for a cold process, so this is just a relaunch against the
+    # persisted db/umbra.db — the data survives. Record the PID so ./stop
+    # (a separate process) can kill exactly this server.
+    #
+    # ASYNCIO=0 mirrors the -e ASYNCIO=0 the Docker branch passes below, so a
+    # local run measures the same IO path as the published numbers. It also
+    # makes the cold column meaningful: the async path sizes its io threads
+    # from measured bandwidth, and that feedback loop turns the once-per-query
+    # cold try into a coin flip (whole-suite cold totals moved by ~40% between
+    # identical runs, single queries by 3-5x). With it disabled the same suite
+    # repeats to under 1%. Override by exporting ASYNCIO=1 to benchmark the
+    # async path deliberately.
+    ASYNCIO="${ASYNCIO:-0}" "$SERVER" db/umbra.db &>> server.log &
+    echo $! > "$SERVER_PID_FILE"
+    exit 0
+fi
+
+# Umbra settings are read from the environment (a setting "numa.transactionnodes"
+# from NUMA_TRANSACTIONNODES). Forward the ones named in UMBRA_FORWARD so a run
+# can be configured without a new image.
+UMBRA_ENV=()
+for var in ${UMBRA_FORWARD:-PARALLEL BUFFERSIZE MEMORY NUMA_TRANSACTIONNODES}; do
+    [ -n "${!var:-}" ] && UMBRA_ENV+=("-e" "$var=${!var}")
+done
+
+sudo docker stop umbradb >/dev/null 2>&1 || true
+sudo docker rm umbradb >/dev/null 2>&1 || true
 
 # Disable asynchronous IO, the EBS GP2 device provides only 250 MiB/s. Therefore,
 # async IO is not needed to exploit the full bandwidth.
@@ -15,4 +57,5 @@ sudo docker run -d --name umbradb \
     --ulimit nofile=1048576:1048576 \
     --ulimit memlock=-1:-1 \
     -e ASYNCIO=0 \
-    umbradb/umbra:26.09 >/dev/null
+    "${UMBRA_ENV[@]}" \
+    "umbradb/umbra:${VERSION}" >/dev/null
