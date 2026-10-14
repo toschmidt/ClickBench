@@ -12,10 +12,12 @@ source ../local-env.sh
 # create.sql (Docker) reads /data/hits.parquet from the container's '/data'
 # bind mount; create_local.sql reads the host-relative data/hits.parquet
 # (the local server's CWD is the umbra dir). Both ingest via umbra.parquetview.
+#
+# COMPRESSION picks the table's compression (zstd by default, e.g. COMPRESSION=zopp).
 CREATE_FILE=create.sql
 [ "$LOCAL" -eq 1 ] && CREATE_FILE=create_local.sql
-PGPASSWORD=postgres psql -p 5432 -h 127.0.0.1 -U postgres \
-    -v ON_ERROR_STOP=1 -f "$CREATE_FILE"
+sed "s/with (compression=zstd)/with (compression=${COMPRESSION:-zstd})/" "$CREATE_FILE" |
+    PGPASSWORD=postgres psql -p 5432 -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -f -
 
 if [ "$TRACE" -eq 1 ]; then
     mkdir -p "$TRACE_DIR"
